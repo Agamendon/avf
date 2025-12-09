@@ -1,0 +1,126 @@
+;;;
+;;; AVF - AV Filter Minifilter Driver
+;;;
+;;; Copyright (c) 2024
+;;;
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = "ActivityMonitor"                         ;This is determined by the work this filter driver does
+ClassGuid   = {b86dff51-a31e-4bac-b3cf-e8cfe75c9fc2}    ;This value is determined by the Class
+Provider    = %ProviderString%
+DriverVer   = 01/01/2024,1.0.0.0
+CatalogFile = avf.cat
+PnpLockdown = 1
+
+[SourceDisksFiles]
+avf.sys = 1,,
+
+[SourceDisksNames]
+1 = %DiskId1%,,,
+
+[DestinationDirs]
+AvfDownlevel.CopyDriverFiles = 12            ;%windir%\system32\drivers
+AvfDownlevel.DelDriverFiles  = 12            ;%windir%\system32\drivers
+Avf.Files                    = 13            ;driver store
+
+;;
+;; Default install sections
+;;
+
+[DefaultInstall.NT$ARCH$.10.0...25952]
+OptionDesc          = %ServiceDescription%
+CopyFiles           = Avf.Files
+
+[DefaultInstall.NT$ARCH$.10.0...25952.Services]
+AddService          = %ServiceName%,,Avf.Service
+
+;
+; Support sections
+;
+
+[Avf.Service]
+DisplayName      = %ServiceName%
+Description      = %ServiceDescription%
+ServiceBinary    = %13%\%DriverName%.sys        ;%windir%\system32\drivers\
+Dependencies     = FltMgr
+ServiceType      = 2                            ;SERVICE_FILE_SYSTEM_DRIVER
+StartType        = 3                            ;SERVICE_DEMAND_START
+ErrorControl     = 1                            ;SERVICE_ERROR_NORMAL
+LoadOrderGroup   = "FSFilter Anti-Virus"
+AddReg           = Avf.AddRegistry
+
+[Avf.AddRegistry]
+HKR,"Parameters","SupportedFeatures",0x00010001,0x3
+HKR,"Parameters\Instances","DefaultInstance",0x00000000,%DefaultInstance%
+HKR,"Parameters\Instances\"%Instance1.Name%,"Altitude",0x00000000,%Instance1.Altitude%
+HKR,"Parameters\Instances\"%Instance1.Name%,"Flags",0x00010001,%Instance1.Flags%
+
+[Avf.Files]
+%DriverName%.sys
+
+;;
+;; Downlevel default install sections
+;;
+
+[DefaultInstall.NT$ARCH$]
+OptionDesc          = %ServiceDescription%
+CopyFiles           = AvfDownlevel.CopyDriverFiles
+
+[DefaultInstall.NT$ARCH$.Services]
+AddService          = %ServiceName%,,AvfDownlevel.Service
+
+;;
+;; Downlevel default uninstall sections
+;;
+
+[DefaultUninstall.NT$ARCH$]
+LegacyUninstall = 1
+DelFiles        = AvfDownlevel.DelDriverFiles
+
+[DefaultUninstall.NT$ARCH$.Services]
+DelService      = %ServiceName%,0x200      ;Ensure service is stopped before deleting
+
+;
+; Downlevel support sections
+;
+
+[AvfDownlevel.Service]
+DisplayName      = %ServiceName%
+Description      = %ServiceDescription%
+ServiceBinary    = %12%\%DriverName%.sys        ;%windir%\system32\drivers\
+Dependencies     = FltMgr
+ServiceType      = 2                            ;SERVICE_FILE_SYSTEM_DRIVER
+StartType        = 3                            ;SERVICE_DEMAND_START
+ErrorControl     = 1                            ;SERVICE_ERROR_NORMAL
+LoadOrderGroup   = "FSFilter Anti-Virus"
+AddReg           = AvfDownlevel.AddRegistry
+
+[AvfDownlevel.AddRegistry]
+HKR,,"SupportedFeatures",0x00010001,0x3
+HKR,"Instances","DefaultInstance",0x00000000,%DefaultInstance%
+HKR,"Instances\"%Instance1.Name%,"Altitude",0x00000000,%Instance1.Altitude%
+HKR,"Instances\"%Instance1.Name%,"Flags",0x00010001,%Instance1.Flags%
+
+[AvfDownlevel.CopyDriverFiles]
+%DriverName%.sys
+
+[AvfDownlevel.DelDriverFiles]
+%DriverName%.sys
+
+;;
+;; String Section
+;;
+
+[Strings]
+ProviderString          = "AVF"
+ServiceDescription      = "AV Filter Minifilter Driver"
+ServiceName             = "avf"
+DriverName              = "avf"
+DiskId1                 = "AV Filter Installation Disk"
+
+;Instances specific information.
+DefaultInstance         = "AVF Instance"
+Instance1.Name          = "AVF Instance"
+Instance1.Altitude      = "320000"
+Instance1.Flags         = 0x0          ; Allow automatic attachments
