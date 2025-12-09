@@ -251,7 +251,7 @@ typedef struct _AVF_REPLY {
 //
 
 #define AVF_CONSULTANT_PIPE_NAME    L"\\\\.\\pipe\\AvfSecurityConsultant"
-#define AVF_CONSULTANT_TIMEOUT_MS   15000   // 15 second timeout for consultation
+#define AVF_CONSULTANT_TIMEOUT_MS   60000   // 60 second timeout for consultation
 
 //
 //  Request sent from AVF to the security consultant

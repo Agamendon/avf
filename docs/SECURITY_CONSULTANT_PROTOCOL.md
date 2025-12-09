@@ -9,7 +9,7 @@ The AVF (AV Filter) user-mode process can delegate security decisions to an exte
 **Transport:** Windows Named Pipe  
 **Pipe Name:** `\\.\pipe\AvfSecurityConsultant`  
 **Mode:** Message mode (synchronous request/response)  
-**Timeout:** 15 seconds (configurable via `AVF_CONSULTANT_TIMEOUT_MS`)
+**Timeout:** 60 seconds (configurable via `AVF_CONSULTANT_TIMEOUT_MS`)
 
 ## Protocol Flow
 
@@ -168,21 +168,39 @@ int main() {
 
 ```python
 import signal
-import struct
 import time
 import win32pipe
 import win32file
 import pywintypes
+import ctypes
 
 PIPE_NAME = r'\\.\pipe\AvfSecurityConsultant'
 PROTOCOL_VERSION = 1
 DECISION_ALLOW = 0
 DECISION_BLOCK = 1
 
-# Structure sizes (must match avf.h)
-REQUEST_SIZE = 4 + 4 + 4 + 4 + 520 + 1040  # 1576 bytes
-RESPONSE_SIZE = 16  # 4 ULONGs
-RESPONSE_FORMAT = '<IIII'
+AVF_MAX_PATH = 520  # match avf.h exactly
+
+class AVF_CONSULTANT_REQUEST(ctypes.Structure):
+    _fields_ = [
+        ("Version",     ctypes.c_uint32),
+        ("RequestId",   ctypes.c_uint32),
+        ("ProcessId",   ctypes.c_uint32),
+        ("Operation",   ctypes.c_uint32),
+        ("ProcessName", ctypes.c_wchar * 260),
+        ("FileName",    ctypes.c_wchar * AVF_MAX_PATH),
+    ]
+
+class AVF_CONSULTANT_RESPONSE(ctypes.Structure):
+    _fields_ = [
+        ("Version",   ctypes.c_uint32),
+        ("RequestId", ctypes.c_uint32),
+        ("Decision",  ctypes.c_uint32),
+        ("Reason",    ctypes.c_uint32),
+    ]
+
+REQUEST_SIZE  = ctypes.sizeof(AVF_CONSULTANT_REQUEST)
+RESPONSE_SIZE = ctypes.sizeof(AVF_CONSULTANT_RESPONSE)
 
 g_running = True
 
@@ -195,7 +213,7 @@ def create_pipe():
     return win32pipe.CreateNamedPipe(
         PIPE_NAME,
         win32pipe.PIPE_ACCESS_DUPLEX,
-        win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_NOWAIT,
+        win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE,  # blocking
         win32pipe.PIPE_UNLIMITED_INSTANCES,
         RESPONSE_SIZE,
         REQUEST_SIZE,
@@ -203,133 +221,90 @@ def create_pipe():
         None
     )
 
+def make_response(request_id, decision, reason=0):
+    resp = AVF_CONSULTANT_RESPONSE()
+    resp.Version   = PROTOCOL_VERSION
+    resp.RequestId = request_id
+    resp.Decision  = decision
+    resp.Reason    = reason
+    return bytes(resp)
+
 def parse_request(data):
     if len(data) < REQUEST_SIZE:
         return None
-    
-    version, request_id, process_id, operation = struct.unpack('<IIII', data[:16])
-    process_name = data[16:536].decode('utf-16-le', errors='ignore').split('\x00')[0]
-    file_name = data[536:1576].decode('utf-16-le', errors='ignore').split('\x00')[0]
-    
+    req = AVF_CONSULTANT_REQUEST.from_buffer_copy(data)
     return {
-        'version': version,
-        'request_id': request_id,
-        'process_id': process_id,
-        'operation': operation,
-        'process_name': process_name,
-        'file_name': file_name
+        'version':      req.Version,
+        'request_id':   req.RequestId,
+        'process_id':   req.ProcessId,
+        'operation':    req.Operation,
+        'process_name': req.ProcessName,
+        'file_name':    req.FileName,
     }
 
-def make_response(request_id, decision, reason=0):
-    return struct.pack(RESPONSE_FORMAT, PROTOCOL_VERSION, request_id, decision, reason)
-
 def should_block(request):
-    """
-    YOUR SECURITY LOGIC HERE - Keep it FAST!
-    """
-    # Handle handshake request (Operation = 0xFF)
-    if request['operation'] == 0xFF:
-        print(f"  [Handshake] Received from PID {request['process_id']}")
-        return False  # Always allow handshake
-    
-    # Example: Block ALL writes, allow reads and opens
+    if request['operation'] == 0xFF:  # handshake
+        print(f"  [Handshake] from PID {request['process_id']}")
+        return False
     if request['operation'] == 4:  # IRP_MJ_WRITE
         return True
-    # Uncomment to also block file opens:
-    # if request['operation'] == 0:  # IRP_MJ_CREATE
-    #     return True
     return False
 
-def get_operation_name(op):
-    """Convert operation code to string."""
-    ops = {0: 'OPEN', 3: 'READ', 4: 'WRITE', 0xFF: 'HSHAKE'}
-    return ops.get(op, f'OP{op}')
-
 def handle_client(pipe):
-    """Handle a single client connection."""
-    # Switch to blocking mode for reads
-    win32pipe.SetNamedPipeHandleState(pipe, win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_WAIT, None, None)
-    
     request_count = 0
     try:
         while g_running:
-            try:
-                result, data = win32file.ReadFile(pipe, REQUEST_SIZE)
-                request_count += 1
-                
-                request = parse_request(data)
-                if request is None:
-                    win32file.WriteFile(pipe, make_response(0, DECISION_ALLOW))
-                    continue
-                
-                decision = DECISION_BLOCK if should_block(request) else DECISION_ALLOW
-                win32file.WriteFile(pipe, make_response(request['request_id'], decision))
-                
-                op = get_operation_name(request['operation'])
-                dec = 'BLOCK' if decision else 'ALLOW'
-                print(f"[{request_count:4d}] [{dec:5s}] [{op:5s}] PID:{request['process_id']:5d} {request['process_name']} -> {request['file_name']}")
-                
-            except pywintypes.error as e:
-                if e.winerror in (109, 232, 995):  # BROKEN_PIPE, NO_DATA, ABORTED
-                    break
-                raise
-    except KeyboardInterrupt:
-        pass
-    
+            result, data = win32file.ReadFile(pipe, REQUEST_SIZE)
+            request_count += 1
+
+            req = parse_request(data)
+            if req is None:
+                win32file.WriteFile(pipe, make_response(0, DECISION_ALLOW))
+                continue
+
+            decision = DECISION_BLOCK if should_block(req) else DECISION_ALLOW
+            win32file.WriteFile(pipe, make_response(req['request_id'], decision))
+
+            op  = {0: 'OPEN', 3: 'READ', 4: 'WRITE', 0xFF: 'HSHAKE'}.get(req['operation'], f'OP{req["operation"]}')
+            dec = 'BLOCK' if decision else 'ALLOW'
+            print(f"[{request_count:4d}] [{dec:5s}] [{op:6s}] PID:{req['process_id']:5d} {req['process_name']} -> {req['file_name']}")
+
+    except pywintypes.error as e:
+        # 109: BROKEN_PIPE, 995: OPERATION_ABORTED
+        if e.winerror not in (109, 995):
+            print("Pipe error:", e)
     return request_count
 
 def main():
-    global g_running
-    
-    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGINT,  signal_handler)
     signal.signal(signal.SIGBREAK, signal_handler)
-    
+
     print(f"Security Consultant listening on {PIPE_NAME}")
     print("Start avf.exe at any time - connection is automatic.")
     print("Press Ctrl+C to exit.\n")
-    
+
     total_requests = 0
     session_count = 0
-    
+
     while g_running:
         pipe = None
         try:
             pipe = create_pipe()
             print("Waiting for AVF to connect...")
-            
-            # Poll for connection (non-blocking pipe)
-            connected = False
-            while g_running and not connected:
-                try:
-                    win32pipe.ConnectNamedPipe(pipe, None)
-                    connected = True
-                except pywintypes.error as e:
-                    if e.winerror == 535:  # ERROR_PIPE_CONNECTED - already connected!
-                        connected = True
-                    elif e.winerror == 536:  # ERROR_PIPE_LISTENING - no client yet
-                        time.sleep(0.1)  # Poll every 100ms
-                    else:
-                        raise
-            
+            win32pipe.ConnectNamedPipe(pipe, None)  # blocking wait
+
             if not g_running:
                 break
-            
+
             session_count += 1
             print(f"[Session {session_count}] AVF connected!\n")
-            
+
             requests = handle_client(pipe)
             total_requests += requests
-            
             print(f"[Session {session_count}] Ended. {requests} requests.\n")
-            
+
         except pywintypes.error as e:
-            if e.winerror == 231:  # ERROR_PIPE_BUSY
-                time.sleep(0.1)
-                continue
-            elif e.winerror != 995:  # Not ABORTED
-                print(f"Error: {e}")
-        except KeyboardInterrupt:
-            break
+            print("Error:", e)
         finally:
             if pipe:
                 try:
@@ -340,14 +315,14 @@ def main():
                     win32file.CloseHandle(pipe)
                 except:
                     pass
-    
+
     print(f"\nTotal: {session_count} sessions, {total_requests} requests. Goodbye!")
 
 if __name__ == '__main__':
     main()
 ```
 
-> **IMPORTANT**: The kernel driver waits up to 15 seconds for a response. Long-running analysis is supported, but will block the file operation during that time.
+> **IMPORTANT**: The kernel driver waits up to 60 seconds for a response. Long-running analysis is supported, but will block the file operation during that time.
 
 > **Note**: Start avf.exe or the consultant in any order - they auto-connect on file access.
 

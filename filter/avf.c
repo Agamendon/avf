@@ -496,7 +496,7 @@ Return Value:
     //
 
     replyLength = sizeof(reply);
-    timeout.QuadPart = -150000000LL;  // 15 second timeout (100ns units, negative = relative)
+    timeout.QuadPart = -600000000LL;  // 60 second timeout (100ns units, negative = relative)
 
     status = FltSendMessage(gFilterHandle,
                             &gClientPort,
