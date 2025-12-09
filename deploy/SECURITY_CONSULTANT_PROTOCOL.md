@@ -9,7 +9,7 @@ The AVF (AV Filter) user-mode process can delegate security decisions to an exte
 **Transport:** Windows Named Pipe  
 **Pipe Name:** `\\.\pipe\AvfSecurityConsultant`  
 **Mode:** Message mode (synchronous request/response)  
-**Timeout:** 15 seconds (configurable via `AVF_CONSULTANT_TIMEOUT_MS`)
+**Timeout:** 60 seconds (configurable via `AVF_CONSULTANT_TIMEOUT_MS`)
 
 ## Protocol Flow
 
@@ -322,7 +322,7 @@ if __name__ == '__main__':
     main()
 ```
 
-> **IMPORTANT**: The kernel driver waits up to 15 seconds for a response. Long-running analysis is supported, but will block the file operation during that time.
+> **IMPORTANT**: The kernel driver waits up to 60 seconds for a response. Long-running analysis is supported, but will block the file operation during that time.
 
 > **Note**: Start avf.exe or the consultant in any order - they auto-connect on file access.
 

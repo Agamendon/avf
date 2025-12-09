@@ -13,6 +13,9 @@ Abstract:
     of the AV Filter. It connects to the kernel minifilter and receives
     notifications about file accesses.
 
+    This version uses multiple worker threads to handle requests concurrently,
+    preventing deadlocks when the consultant needs to access files.
+
 Environment:
 
     User mode
@@ -27,12 +30,26 @@ Environment:
 #include "avf.h"
 
 //
+//  Configuration
+//
+
+#define AVF_WORKER_THREAD_COUNT     4
+#define AVF_MAX_PENDING_REQUESTS    16
+
+//
 //  Global variables
 //
 
 HANDLE gPort = INVALID_HANDLE_VALUE;
-HANDLE gConsultantPipe = INVALID_HANDLE_VALUE;
+HANDLE gCompletionPort = INVALID_HANDLE_VALUE;
 volatile BOOLEAN gRunning = TRUE;
+
+//
+//  Consultant connection - protected by critical section
+//
+
+CRITICAL_SECTION gConsultantLock;
+HANDLE gConsultantPipe = INVALID_HANDLE_VALUE;
 BOOLEAN gConsultantConnected = FALSE;
 
 //
@@ -42,6 +59,25 @@ BOOLEAN gConsultantConnected = FALSE;
 #define MAX_PROTECTED_FILES 100
 WCHAR gProtectedFiles[MAX_PROTECTED_FILES][AVF_MAX_PATH];
 ULONG gProtectedFileCount = 0;
+
+//
+//  Worker thread context
+//
+
+typedef struct _AVF_WORKER_CONTEXT {
+    HANDLE Port;
+    HANDLE CompletionPort;
+} AVF_WORKER_CONTEXT, *PAVF_WORKER_CONTEXT;
+
+//
+//  Message structure for async operations
+//
+
+typedef struct _AVF_MESSAGE {
+    FILTER_MESSAGE_HEADER Header;
+    AVF_FILE_NOTIFICATION Notification;
+    OVERLAPPED Overlapped;
+} AVF_MESSAGE, *PAVF_MESSAGE;
 
 //
 //  Function prototypes
@@ -75,14 +111,14 @@ IsFileProtected(
     _In_ PCWSTR FilePath
     );
 
-VOID
-PrintUsage(
-    VOID
-    );
-
 BOOL WINAPI
 ConsoleCtrlHandler(
     DWORD CtrlType
+    );
+
+DWORD WINAPI
+WorkerThread(
+    _In_ LPVOID lpParameter
     );
 
 
@@ -96,7 +132,7 @@ wmain(
 Routine Description:
 
     Main entry point for the userspace listener application.
-    Connects to the minifilter and listens for file access notifications.
+    Creates worker threads and an I/O completion port for concurrent request handling.
 
 Arguments:
 
@@ -109,22 +145,21 @@ Return Value:
 
 --*/
 {
-HRESULT hr;
-UCHAR messageBuffer[sizeof(FILTER_MESSAGE_HEADER) + sizeof(AVF_FILE_NOTIFICATION)];
-PFILTER_MESSAGE_HEADER pMessage;
-PAVF_FILE_NOTIFICATION pNotification;
-int i;
+    HRESULT hr;
+    int i;
+    HANDLE workerThreads[AVF_WORKER_THREAD_COUNT];
+    AVF_WORKER_CONTEXT workerContext;
+    PAVF_MESSAGE messages[AVF_MAX_PENDING_REQUESTS];
+    DWORD threadId;
 
-//
-//  Reply structure with FILTER_REPLY_HEADER
-//
-struct {
-    FILTER_REPLY_HEADER Header;
-    AVF_REPLY Reply;
-} replyBuffer;
+    wprintf(L"AV Filter - File Access Monitor (Multi-threaded)\n");
+    wprintf(L"=================================================\n\n");
 
-    wprintf(L"AV Filter - File Access Monitor\n");
-    wprintf(L"================================\n\n");
+    //
+    //  Initialize critical section for consultant access
+    //
+
+    InitializeCriticalSection(&gConsultantLock);
 
     //
     //  Parse command line arguments
@@ -176,10 +211,23 @@ struct {
         wprintf(L"ERROR: Failed to connect to filter (0x%08X)\n", hr);
         wprintf(L"Make sure the avf driver is loaded.\n");
         wprintf(L"Run: fltmc load avf\n");
+        DeleteCriticalSection(&gConsultantLock);
         return 1;
     }
 
     wprintf(L"Connected to avf filter.\n");
+
+    //
+    //  Create I/O completion port
+    //
+
+    gCompletionPort = CreateIoCompletionPort(gPort, NULL, 0, AVF_WORKER_THREAD_COUNT);
+    if (gCompletionPort == NULL) {
+        wprintf(L"ERROR: Failed to create completion port (error %lu)\n", GetLastError());
+        CloseHandle(gPort);
+        DeleteCriticalSection(&gConsultantLock);
+        return 1;
+    }
 
     //
     //  Try to connect to security consultant
@@ -189,41 +237,194 @@ struct {
         wprintf(L"Connected to security consultant.\n");
     } else {
         wprintf(L"Security consultant not available - will allow all operations.\n");
-        wprintf(L"Start avfConsultant.exe to enable security decisions.\n");
+        wprintf(L"Start consultant to enable security decisions.\n");
+    }
+
+    wprintf(L"\nStarting %d worker threads...\n", AVF_WORKER_THREAD_COUNT);
+
+    //
+    //  Set up worker context
+    //
+
+    workerContext.Port = gPort;
+    workerContext.CompletionPort = gCompletionPort;
+
+    //
+    //  Create worker threads
+    //
+
+    for (i = 0; i < AVF_WORKER_THREAD_COUNT; i++) {
+        workerThreads[i] = CreateThread(
+                            NULL,
+                            0,
+                            WorkerThread,
+                            &workerContext,
+                            0,
+                            &threadId);
+
+        if (workerThreads[i] == NULL) {
+            wprintf(L"ERROR: Failed to create worker thread %d (error %lu)\n", i, GetLastError());
+        } else {
+            wprintf(L"  Worker thread %d started (TID %lu)\n", i, threadId);
+        }
+    }
+
+    //
+    //  Allocate message structures and queue initial async reads
+    //
+
+    for (i = 0; i < AVF_MAX_PENDING_REQUESTS; i++) {
+        messages[i] = (PAVF_MESSAGE)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(AVF_MESSAGE));
+        if (messages[i] != NULL) {
+            hr = FilterGetMessage(gPort, &messages[i]->Header, sizeof(AVF_MESSAGE), &messages[i]->Overlapped);
+            if (hr != HRESULT_FROM_WIN32(ERROR_IO_PENDING) && FAILED(hr)) {
+                wprintf(L"WARNING: Failed to queue message %d (0x%08X)\n", i, hr);
+            }
+        }
     }
 
     wprintf(L"\nWaiting for file access events...\n\n");
 
     //
-    //  Main loop - receive notifications from the filter
+    //  Wait for shutdown signal
     //
 
-    pMessage = (PFILTER_MESSAGE_HEADER)messageBuffer;
+    while (gRunning) {
+        Sleep(100);
+    }
+
+    //
+    //  Signal workers to stop by posting completion packets
+    //
+
+    for (i = 0; i < AVF_WORKER_THREAD_COUNT; i++) {
+        PostQueuedCompletionStatus(gCompletionPort, 0, 0, NULL);
+    }
+
+    //
+    //  Wait for worker threads to exit
+    //
+
+    WaitForMultipleObjects(AVF_WORKER_THREAD_COUNT, workerThreads, TRUE, 5000);
+
+    //
+    //  Cleanup worker threads
+    //
+
+    for (i = 0; i < AVF_WORKER_THREAD_COUNT; i++) {
+        if (workerThreads[i] != NULL) {
+            CloseHandle(workerThreads[i]);
+        }
+    }
+
+    //
+    //  Free message structures
+    //
+
+    for (i = 0; i < AVF_MAX_PENDING_REQUESTS; i++) {
+        if (messages[i] != NULL) {
+            HeapFree(GetProcessHeap(), 0, messages[i]);
+        }
+    }
+
+    //
+    //  Cleanup
+    //
+
+    EnterCriticalSection(&gConsultantLock);
+    if (gConsultantPipe != INVALID_HANDLE_VALUE) {
+        CloseHandle(gConsultantPipe);
+        gConsultantPipe = INVALID_HANDLE_VALUE;
+    }
+    LeaveCriticalSection(&gConsultantLock);
+
+    if (gCompletionPort != INVALID_HANDLE_VALUE) {
+        CloseHandle(gCompletionPort);
+        gCompletionPort = INVALID_HANDLE_VALUE;
+    }
+
+    if (gPort != INVALID_HANDLE_VALUE) {
+        CloseHandle(gPort);
+        gPort = INVALID_HANDLE_VALUE;
+    }
+
+    DeleteCriticalSection(&gConsultantLock);
+
+    wprintf(L"\nExiting...\n");
+    return 0;
+}
+
+
+DWORD WINAPI
+WorkerThread(
+    _In_ LPVOID lpParameter
+    )
+/*++
+
+Routine Description:
+
+    Worker thread that processes file access notifications from the kernel.
+
+Arguments:
+
+    lpParameter - Pointer to AVF_WORKER_CONTEXT.
+
+Return Value:
+
+    Thread exit code.
+
+--*/
+{
+    PAVF_WORKER_CONTEXT context = (PAVF_WORKER_CONTEXT)lpParameter;
+    DWORD bytesTransferred;
+    ULONG_PTR completionKey;
+    LPOVERLAPPED overlapped;
+    PAVF_MESSAGE message;
+    PAVF_FILE_NOTIFICATION pNotification;
+    HRESULT hr;
+    DWORD threadId = GetCurrentThreadId();
+
+    struct {
+        FILTER_REPLY_HEADER Header;
+        AVF_REPLY Reply;
+    } replyBuffer;
 
     while (gRunning) {
+        //
+        //  Wait for a completion packet
+        //
 
-        hr = FilterGetMessage(
-                gPort,
-                pMessage,
-                sizeof(messageBuffer),
-                NULL);
+        if (!GetQueuedCompletionStatus(
+                context->CompletionPort,
+                &bytesTransferred,
+                &completionKey,
+                &overlapped,
+                1000)) {  // 1 second timeout
 
-        if (FAILED(hr)) {
-            if (hr == HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED)) {
-                //
-                //  Port was closed, exit normally
-                //
-                break;
+            DWORD error = GetLastError();
+            if (error == WAIT_TIMEOUT) {
+                continue;
             }
-            wprintf(L"ERROR: FilterGetMessage failed (0x%08X)\n", hr);
+            if (error == ERROR_OPERATION_ABORTED) {
+                continue;
+            }
             break;
         }
 
         //
-        //  Extract notification from message
+        //  Check for shutdown signal (NULL overlapped)
         //
 
-        pNotification = (PAVF_FILE_NOTIFICATION)(pMessage + 1);
+        if (overlapped == NULL) {
+            break;
+        }
+
+        //
+        //  Get the message structure from the overlapped pointer
+        //
+
+        message = CONTAINING_RECORD(overlapped, AVF_MESSAGE, Overlapped);
+        pNotification = &message->Notification;
 
         //
         //  Check if this file is in our protected list
@@ -235,7 +436,8 @@ struct {
             //  Print the file access information
             //
 
-            wprintf(L"[%s] PID: %5lu  Process: %-20s  File: %s\n",
+            wprintf(L"[T%lu] [%s] PID: %5lu  Process: %-20s  File: %s\n",
+                    threadId,
                     pNotification->MajorFunction == IRP_MJ_CREATE ? L"OPEN " :
                     pNotification->MajorFunction == IRP_MJ_READ ? L"READ " : L"WRITE",
                     pNotification->ProcessId,
@@ -243,37 +445,47 @@ struct {
                     pNotification->FileName);
 
             //
-            //  Query security consultant - try to connect if not connected
+            //  Query security consultant (thread-safe)
             //
+
+            EnterCriticalSection(&gConsultantLock);
 
             if (!gConsultantConnected) {
                 //
-                //  Try to reconnect to consultant (may have started after us)
+                //  Try to reconnect to consultant
                 //
                 if (ConnectToConsultant()) {
-                    wprintf(L"  -> Connected to security consultant\n");
+                    wprintf(L"  [T%lu] -> Connected to security consultant\n", threadId);
                 }
             }
 
             if (gConsultantConnected) {
                 AVF_CONSULTANT_RESPONSE response;
 
-                if (QueryConsultant(pNotification, &response)) {
+                LeaveCriticalSection(&gConsultantLock);
+
+                //
+                //  Query consultant outside of lock to allow concurrent queries
+                //
+
+                EnterCriticalSection(&gConsultantLock);
+                BOOL connected = gConsultantConnected;
+                LeaveCriticalSection(&gConsultantLock);
+
+                if (connected && QueryConsultant(pNotification, &response)) {
                     if (response.Decision == AVF_DECISION_BLOCK) {
-                        wprintf(L"  -> BLOCKED by consultant (reason code: %lu)\n", response.Reason);
+                        wprintf(L"  [T%lu] -> BLOCKED by consultant (reason code: %lu)\n", threadId, response.Reason);
                         replyBuffer.Reply.BlockOperation = 1;
                     } else {
-                        wprintf(L"  -> ALLOWED by consultant\n");
+                        wprintf(L"  [T%lu] -> ALLOWED by consultant\n", threadId);
                         replyBuffer.Reply.BlockOperation = 0;
                     }
                 } else {
-                    //
-                    //  Consultant disconnected or error - allow by default
-                    //
-                    wprintf(L"  -> Consultant disconnected, allowing\n");
+                    wprintf(L"  [T%lu] -> Consultant disconnected, allowing\n", threadId);
                     replyBuffer.Reply.BlockOperation = 0;
                 }
             } else {
+                LeaveCriticalSection(&gConsultantLock);
                 replyBuffer.Reply.BlockOperation = 0;
             }
         } else {
@@ -288,33 +500,31 @@ struct {
         //
 
         replyBuffer.Header.Status = 0;
-        replyBuffer.Header.MessageId = pMessage->MessageId;
+        replyBuffer.Header.MessageId = message->Header.MessageId;
 
         hr = FilterReplyMessage(
-                gPort,
+                context->Port,
                 &replyBuffer.Header,
                 sizeof(replyBuffer.Header) + sizeof(replyBuffer.Reply));
 
         if (FAILED(hr)) {
-            wprintf(L"WARNING: FilterReplyMessage failed (0x%08X)\n", hr);
+            wprintf(L"  [T%lu] WARNING: FilterReplyMessage failed (0x%08X)\n", threadId, hr);
+        }
+
+        //
+        //  Queue another async read using the same message buffer
+        //
+
+        RtlZeroMemory(&message->Overlapped, sizeof(OVERLAPPED));
+        hr = FilterGetMessage(context->Port, &message->Header, sizeof(AVF_MESSAGE), &message->Overlapped);
+        if (hr != HRESULT_FROM_WIN32(ERROR_IO_PENDING) && FAILED(hr)) {
+            if (hr != HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED)) {
+                wprintf(L"  [T%lu] WARNING: FilterGetMessage failed (0x%08X)\n", threadId, hr);
+            }
         }
     }
 
-    //
-    //  Cleanup
-    //
-
-    if (gConsultantPipe != INVALID_HANDLE_VALUE) {
-        CloseHandle(gConsultantPipe);
-        gConsultantPipe = INVALID_HANDLE_VALUE;
-    }
-
-    if (gPort != INVALID_HANDLE_VALUE) {
-        CloseHandle(gPort);
-        gPort = INVALID_HANDLE_VALUE;
-    }
-
-    wprintf(L"\nExiting...\n");
+    wprintf(L"  [T%lu] Worker thread exiting\n", threadId);
     return 0;
 }
 
@@ -684,6 +894,7 @@ QueryConsultant(
 Routine Description:
 
     Sends a file access query to the security consultant and gets the response.
+    Thread-safe - uses critical section to protect pipe access.
 
 Arguments:
 
@@ -699,9 +910,13 @@ Return Value:
     AVF_CONSULTANT_REQUEST request;
     DWORD bytesWritten;
     DWORD bytesRead;
-    static ULONG requestId = 0;
+    static volatile LONG requestId = 0;
+    ULONG thisRequestId;
+
+    EnterCriticalSection(&gConsultantLock);
 
     if (!gConsultantConnected || gConsultantPipe == INVALID_HANDLE_VALUE) {
+        LeaveCriticalSection(&gConsultantLock);
         return FALSE;
     }
 
@@ -709,9 +924,11 @@ Return Value:
     //  Build request
     //
 
+    thisRequestId = (ULONG)InterlockedIncrement(&requestId);
+
     RtlZeroMemory(&request, sizeof(request));
     request.Version = AVF_CONSULTANT_PROTOCOL_VERSION;
-    request.RequestId = ++requestId;
+    request.RequestId = thisRequestId;
     request.ProcessId = pNotification->ProcessId;
     request.Operation = pNotification->MajorFunction;
     wcscpy_s(request.FileName, AVF_MAX_PATH, pNotification->FileName);
@@ -728,6 +945,7 @@ Return Value:
         CloseHandle(gConsultantPipe);
         gConsultantPipe = INVALID_HANDLE_VALUE;
         gConsultantConnected = FALSE;
+        LeaveCriticalSection(&gConsultantLock);
         return FALSE;
     }
 
@@ -742,8 +960,11 @@ Return Value:
         CloseHandle(gConsultantPipe);
         gConsultantPipe = INVALID_HANDLE_VALUE;
         gConsultantConnected = FALSE;
+        LeaveCriticalSection(&gConsultantLock);
         return FALSE;
     }
+
+    LeaveCriticalSection(&gConsultantLock);
 
     if (bytesRead < sizeof(*pResponse)) {
         return FALSE;
@@ -754,7 +975,7 @@ Return Value:
     //
 
     if (pResponse->Version != AVF_CONSULTANT_PROTOCOL_VERSION ||
-        pResponse->RequestId != request.RequestId) {
+        pResponse->RequestId != thisRequestId) {
         return FALSE;
     }
 
